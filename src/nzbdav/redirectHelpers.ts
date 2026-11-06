@@ -19,6 +19,7 @@
 
 import type { Request } from 'express';
 import { resolveBaseUrl } from '../utils/urlHelpers.js';
+import { isValidPlaybackId } from '../streamTelemetry.js';
 
 /** Base64url-encode a JSON-serializable payload. All payload fields must be
  *  JSON-serializable (number, string, boolean, plain object, plain array).
@@ -59,6 +60,10 @@ export const toContentType = (t: string | undefined): ContentType =>
  *  result-tile fields and the UF tile fields under one schema; per-route
  *  call sites read only the subset they expect. */
 export type TilePayload = {
+  /** Opaque per-tile playback correlation ID. It is not an authentication token. */
+  sid?: string;
+  /** Library-origin WebDAV path, packed into the single iOS-safe tile envelope. */
+  lp?: string;
   sk?: string;
   fbg?: string;
   rc?: number;
@@ -97,6 +102,8 @@ export function parseTilePayload(t: string | undefined): TilePayload {
   if (!raw) return {};
   const isNum = (v: unknown): v is number => typeof v === 'number' && !Number.isNaN(v);
   return {
+    sid: isValidPlaybackId(raw.sid) ? raw.sid : undefined,
+    lp: typeof raw.lp === 'string' ? raw.lp : undefined,
     sk: typeof raw.sk === 'string' ? raw.sk : undefined,
     fbg: typeof raw.fbg === 'string' ? raw.fbg : undefined,
     rc: isNum(raw.rc) && raw.rc >= 0 ? raw.rc : undefined,

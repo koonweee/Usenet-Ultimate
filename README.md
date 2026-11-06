@@ -486,6 +486,13 @@ These are migrated into `config/config.json` on first startup. After that, manag
 | `NZBDAV_PROXY_ENABLED` | `true` | Stream through a local proxy with buffering and reconnection. When disabled, players are redirected directly to the WebDAV URL |
 | `NZBDAV_STREAM_BUFFER_MB` | `128` | Internal proxy buffer size in MB. Larger buffers absorb network jitter but use more memory (min: 8) |
 | `NZBDAV_STREAM_MAX_RECONNECTS` | `30` | Max upstream reconnect attempts before giving up on a proxied stream |
+| `STREAM_TELEMETRY_ENABLED` | `false` | Emit privacy-limited JSON lifecycle events for proxied stream requests. Events include opaque playback/request IDs, byte counters, ranges, reconnect count, and terminal reason; never URLs, paths, credentials, or client IPs |
+
+Telemetry lines begin with `UU_STREAM_EVENT `. A server-generated playback UUID
+stays inside the existing single-parameter stream envelope and survives cached
+delivery, fallback redirects, and seeks without a client change. These events
+measure server-to-client HTTP delivery, not human watch time; `complete` means
+the requested byte range was delivered.
 
 #### NZB Database
 

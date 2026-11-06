@@ -236,13 +236,17 @@ export function buildStreams(ctx: StreamBuildContext): StreamBuildOutput {
     // For native mode, use direct NZB download link
     // Library-origin results (from search-time WebDAV scan) emit a tile URL that
     // carries the videoPath directly. handleStream's early-exit recognizes the
-    // libraryVideoPath query param and serves the file directly without the NZB
-    // grab cycle. URL is shaped as a single query param so Infuse's iOS handoff
-    // (which strips everything after the first '&') doesn't drop the path.
+    // library path in the tile envelope and serves the file directly without the
+    // NZB grab cycle. URL is shaped as a single query param so Infuse's iOS
+    // handoff (which strips everything after the first '&') doesn't drop state.
     if (result.origin === 'library' && result.libraryVideoPath && config.streamingMode === 'nzbdav') {
       const streamManifestKey = requestContext.getStore()?.manifestKey || '';
       const base = `${getBaseUrl()}${getPathPrefix()}/${streamManifestKey}/nzbdav/stream/${encodeURIComponent(streamFilename || result.title || 'stream')}`;
-      const tileUrl = `${base}?libraryVideoPath=${encodeURIComponent(result.libraryVideoPath)}`;
+      const tileT = encodeTileEnvelope({
+        sid: crypto.randomUUID(),
+        lp: result.libraryVideoPath,
+      });
+      const tileUrl = `${base}?t=${tileT}`;
       streams.push({
         name: streamName,
         title: streamTitle,
@@ -275,6 +279,7 @@ export function buildStreams(ctx: StreamBuildContext): StreamBuildOutput {
           : -1;
         const needsEpisodeCtx = result.isSeasonPack && season !== undefined && episode !== undefined;
         const tileT = encodeTileEnvelope({
+          sid: crypto.randomUUID(),
           ...(fallbackGroupId ? { fbg: fallbackGroupId } : {}),
           ...(candidateIdx >= 0 ? { idx: candidateIdx } : {}),
           ...(sessionKey ? { sk: sessionKey } : {}),
@@ -343,6 +348,7 @@ export function buildStreams(ctx: StreamBuildContext): StreamBuildOutput {
       const base = `${getBaseUrl()}${getPathPrefix()}/${streamManifestKey}/nzbdav/stream/${encodeURIComponent(streamFilename || result.title || 'stream')}`;
       const needsEpisodeCtx = result.isSeasonPack && season !== undefined && episode !== undefined;
       const tileT = encodeTileEnvelope({
+        sid: crypto.randomUUID(),
         ...(fallbackGroupId ? { fbg: fallbackGroupId } : {}),
         ...(candidateIdx >= 0 ? { idx: candidateIdx } : {}),
         ...(sessionKey ? { sk: sessionKey } : {}),
@@ -392,6 +398,7 @@ export function buildStreams(ctx: StreamBuildContext): StreamBuildOutput {
     // resolution; the truncated fbg leaves UF unable to look up the group at
     // all. Same envelope shape as the library-delete tiles.
     const ufT = encodeTileEnvelope({
+      sid: crypto.randomUUID(),
       sk: sessionKey,
       ...(fallbackGroupId ? { fbg: fallbackGroupId } : {}),
     });

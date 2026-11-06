@@ -26,10 +26,12 @@ import { incrementRedirectCounterOnUrl } from '../nzbdav/redirectHelpers.js';
 import { getDeleteAllTargets } from '../nzbdav/deleteAllTargetsStore.js';
 import { resolveBaseUrl } from '../utils/urlHelpers.js';
 import { buildSearchCacheKey, deleteSearchCacheEntry } from '../addon/index.js';
+import { StreamRequestTelemetry } from '../streamTelemetry.js';
+import type { StreamEndReason } from '../streamTelemetry.js';
 
 interface NzbdavDeps {
   config: Config;
-  handleStream: (req: any, res: any, nzbdavConfig: NZBDavConfig, proxyFn?: (req: any, res: any, videoPath: string, usePipe: boolean) => Promise<void>) => Promise<void>;
+  handleStream: (req: any, res: any, nzbdavConfig: NZBDavConfig, proxyFn?: (req: any, res: any, videoPath: string, usePipe: boolean, playbackId?: string) => Promise<void>) => Promise<void>;
   getCacheStats: () => any;
   clearStreamCache: () => void;
   clearReadyCache: () => number;
@@ -537,11 +539,12 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
   const TCP_KEEPALIVE_DELAY_MS = 10_000; // Initial delay before first TCP keepalive probe on idle WebDAV sockets — detects dead connections (NAT timeout, TLS half-open) so they get culled from the pool.
 
   // Per-file request tracker — aborts superseded/excess connections.
-  interface TrackedReq { id: number; rangeStart: number; isFullRequest: boolean; abort: () => void; }
+  type RequestAbortReason = 'superseded' | 'concurrency_limit';
+  interface TrackedReq { id: number; rangeStart: number; isFullRequest: boolean; abort: (reason: RequestAbortReason) => void; }
   const activeRequests = new Map<string, TrackedReq[]>();
   let reqIdCounter = 0;
 
-  function trackRequest(filePath: string, rangeStart: number, isFullRequest: boolean, usePipe: boolean, abort: () => void): number {
+  function trackRequest(filePath: string, rangeStart: number, isFullRequest: boolean, usePipe: boolean, abort: (reason: RequestAbortReason) => void): number {
     const id = ++reqIdCounter;
     if (!activeRequests.has(filePath)) activeRequests.set(filePath, []);
     const tracked = activeRequests.get(filePath)!;
@@ -561,14 +564,14 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
       }
     }
     for (const t of toAbort) {
-      t.abort();
+      t.abort('superseded');
     }
 
     // Evict oldest if over the concurrency cap (after supersession cleanup)
     const remaining = tracked.filter(t => !toAbort.includes(t));
     while (remaining.length >= MAX_CONCURRENT_PER_FILE) {
       const oldest = remaining.shift()!;
-      oldest.abort();
+      oldest.abort('concurrency_limit');
     }
 
     remaining.push({ id, rangeStart, isFullRequest, abort });
@@ -767,7 +770,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
   }
 
   /** Proxy video bytes from WebDAV with auth, buffering, and transparent reconnect. */
-  async function proxyVideoStream(req: any, res: any, videoPath: string, usePipeOverride?: boolean): Promise<void> {
+  async function proxyVideoStream(req: any, res: any, videoPath: string, usePipeOverride?: boolean, playbackIdOverride?: string): Promise<void> {
     const webdavBase = (config.nzbdavWebdavUrl || config.nzbdavUrl || 'http://localhost:3000').replace(/\/+$/, '');
     const safePath = encodeWebdavPath(videoPath);
 
@@ -789,11 +792,25 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
     // Resolve usePipe once — used by the request tracker (to gate supersession
     // cleanup) and by consumeUpstream (pipe vs manual branch).
     const usePipe = usePipeOverride ?? ((config.nzbdavStreamingMethod ?? 'proxy') !== 'proxy');
+    const queryPlaybackId = typeof req.query?._sid === 'string' ? req.query._sid : undefined;
+    const telemetry = new StreamRequestTelemetry({
+      playbackId: playbackIdOverride ?? queryPlaybackId,
+      mode: usePipe ? 'pipe' : 'proxy',
+      rangeStart,
+      rangeEnd: clientRange?.end ?? null,
+    });
+    let endReason: StreamEndReason = 'proxy_error';
+    telemetry.start();
+    const progressTimer = telemetry.enabled
+      ? setInterval(() => telemetry.progress(), 30_000)
+      : undefined;
+    progressTimer?.unref();
 
     // Track this request and get an abort handle
     let currentUpstream: http.IncomingMessage | undefined;
     let aborted = false;
-    const reqId = trackRequest(safePath, rangeStart, isFullRequest, usePipe, () => {
+    const reqId = trackRequest(safePath, rangeStart, isFullRequest, usePipe, (reason) => {
+      endReason = reason;
       aborted = true;
       currentUpstream?.destroy();
       if (!res.writableFinished) res.destroy();
@@ -813,6 +830,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         } catch (err: any) {
           if (aborted) return;
           if (attempt >= MAX_PROXY_RETRIES) {
+            endReason = 'upstream_connect_error';
             console.error(`\u274C WebDAV proxy error: ${err.message}`);
             if (!res.headersSent) res.status(502).send('WebDAV proxy error');
             return;
@@ -839,6 +857,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
           currentUpstream = upstream;
           if (aborted) { upstream.destroy(); return; }
         } catch (err: any) {
+          endReason = 'upstream_connect_error';
           console.error(`\u274C WebDAV proxy redirect failed: ${err.message}`);
           if (!res.headersSent) res.status(502).send('WebDAV proxy error');
           return;
@@ -854,6 +873,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
 
       let status = upstream.statusCode ?? 200;
       if (status === 404 || status === 410) {
+        endReason = 'upstream_not_found';
         upstream.destroy();
         throw new WebDav404Error(videoPath, status);
       }
@@ -873,6 +893,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
             break;
           } catch {
             if (attempt >= MAX_PROXY_RETRIES) {
+              endReason = 'upstream_connect_error';
               if (!res.headersSent) res.status(502).send('WebDAV proxy error');
               return;
             }
@@ -892,11 +913,13 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         // as upstream error so the fallback path advances to the next candidate.
         const cl = parseInt((upstream.headers['content-length'] as string) ?? '', 10);
         if (status === 200 && Number.isFinite(cl) && cl === 0) {
+          endReason = 'upstream_truncated';
           upstream.destroy();
           throw new Error(`WebDAV returned empty body on no-Range retry for ${safePath}`);
         }
       }
       if (status !== 200 && status !== 206) {
+        endReason = 'upstream_http_error';
         upstream.destroy();
         console.warn(`\u26A0\uFE0F WebDAV upstream returned ${status} for ${safePath} — triggering fallback`);
         throw new Error(`WebDAV upstream returned ${status}`);
@@ -908,6 +931,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         ? streamRangeStart + parseInt(fwdHeaders['content-length'] as string, 10) - 1
         : null);
       const totalSize = cr?.total ?? null;
+      const expectedBytes = rangeEnd == null ? null : rangeEnd - streamRangeStart + 1;
 
       // Accept-Ranges: always advertise — the reconnect loop below resumes via
       // byte-range requests against nzbdav, so the /v contract is range-capable.
@@ -920,6 +944,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
       // the body is actually the full file, and strict demuxers (Infuse's
       // FFmpeg) fail on the mismatch.
       if (status === 200 && cr && clientRange) status = 206;
+      telemetry.setResponse(status, totalSize);
 
       // Send headers to client
       res.socket?.setNoDelay(true);
@@ -932,15 +957,19 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
 
       // Initial consume attempt
       try {
-        await consumeUpstream(upstream, res, req, (n) => { bytesSent += n; }, 0, usePipe);
+        await consumeUpstream(upstream, res, req, (n) => { bytesSent += n; telemetry.addBytes(n); }, 0, usePipe);
+        endReason = expectedBytes != null && bytesSent < expectedBytes ? 'upstream_truncated' : 'complete';
         if (!res.writableFinished) res.end();
         return;
       } catch {
+        if (!aborted && (req.destroyed || res.destroyed)) endReason = 'client_disconnect';
         if (aborted || req.destroyed || res.writableFinished || res.destroyed) return;
+        endReason = 'upstream_interrupted';
       }
 
       // Upstream failed while client is still alive — reconnect loop
       for (let rc = 1; rc <= UPSTREAM_MAX_RECONNECTS; rc++) {
+        telemetry.setReconnects(rc);
         const resumeByte = streamRangeStart + bytesSent;
         const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** Math.min(rc - 1, 3), RECONNECT_MAX_DELAY_MS);
 
@@ -960,6 +989,9 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
 
         // Non-2xx on reconnect — stop trying
         if (newUpstream.statusCode && newUpstream.statusCode >= 400) {
+          endReason = newUpstream.statusCode === 404 || newUpstream.statusCode === 410
+            ? 'upstream_not_found'
+            : 'upstream_http_error';
           // 404/410: video gone — evict stale cache so player's next retry uses fallback
           if (newUpstream.statusCode === 404 || newUpstream.statusCode === 410) {
             const evicted = evictReadyByVideoPath(videoPath);
@@ -979,6 +1011,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         // Validate Content-Range — detect file replacement
         const newCR = parseContentRange(newUpstream.headers['content-range'] as string);
         if (newCR && totalSize != null && newCR.total != null && newCR.total !== totalSize) {
+          endReason = 'file_size_changed';
           console.warn(`  \u26A0\uFE0F File size changed on reconnect: ${totalSize} \u2192 ${newCR.total}. Ending stream.`);
           newUpstream.destroy();
           if (!res.writableFinished) res.end();
@@ -991,6 +1024,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
           if (newCR.start < resumeByte) {
             skipBytes = resumeByte - newCR.start;
           } else if (newCR.start > resumeByte) {
+            endReason = 'range_gap';
             console.warn(`  \u26A0\uFE0F Gap in stream: expected byte ${resumeByte}, got ${newCR.start}. Ending stream.`);
             newUpstream.destroy();
             if (!res.writableFinished) res.end();
@@ -999,22 +1033,29 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         }
 
         try {
-          await consumeUpstream(newUpstream, res, req, (n) => { bytesSent += n; }, skipBytes, usePipe);
+          await consumeUpstream(newUpstream, res, req, (n) => { bytesSent += n; telemetry.addBytes(n); }, skipBytes, usePipe);
+          endReason = expectedBytes != null && bytesSent < expectedBytes ? 'upstream_truncated' : 'complete';
           if (!res.writableFinished) res.end();
           return;
         } catch {
+          if (!aborted && (req.destroyed || res.destroyed)) endReason = 'client_disconnect';
           if (aborted || req.destroyed || res.writableFinished || res.destroyed) return;
+          endReason = 'upstream_interrupted';
         }
       }
 
+      endReason = 'reconnect_exhausted';
       console.error(`  \u26D4 Exhausted ${UPSTREAM_MAX_RECONNECTS} reconnect attempts for ${safePath}`);
       if (!res.writableFinished) res.end();
     } catch (err: any) {
       if (err instanceof WebDav404Error) throw err;
       if (aborted) return;
+      if (req.destroyed || res.destroyed) endReason = 'client_disconnect';
       if (!res.headersSent) throw err;
       console.error(`\u274C WebDAV proxy error: ${(err as Error).message}`);
     } finally {
+      if (progressTimer) clearInterval(progressTimer);
+      telemetry.end(endReason);
       untrackRequest(safePath, reqId);
     }
   }

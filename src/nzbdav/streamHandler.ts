@@ -19,6 +19,7 @@ import { getFallbackGroup } from './fallbackManager.js';
 import { encodeWebdavPath, nzbdavError, getDeliveryLog, WebDav404Error, buildEpisodePattern, buildDateEpisodePattern, buildNzbdavConfig } from './utils.js';
 import { getSessionPromise, getSessionBackups, ultimateFallbackFromCandidates, type UfBackupStream } from './ultimateFallback.js';
 import { encodeTileEnvelope, incrementRedirectCounter, parseTilePayload } from './redirectHelpers.js';
+import { createPlaybackId } from '../streamTelemetry.js';
 import { ProxyCircuitAbortError } from '../proxy.js';
 import { formatBytes } from '../parsers/metadataParsers.js';
 import { resolveBaseUrl } from '../utils/urlHelpers.js';
@@ -529,7 +530,7 @@ export async function handleStream(
   req: Request,
   res: ExpressResponse,
   config: NZBDavConfig,
-  proxyFn?: (req: Request, res: ExpressResponse, videoPath: string, usePipe: boolean) => Promise<void>
+  proxyFn?: (req: Request, res: ExpressResponse, videoPath: string, usePipe: boolean, playbackId?: string) => Promise<void>
 ): Promise<void> {
   // Express returns string[] for repeated query keys (`?t=a&t=b`). Take the
   // most recent so the decoder treats it as a single string. Catches
@@ -539,16 +540,20 @@ export async function handleStream(
     req.query.t = arr[arr.length - 1] as any;
   }
 
+  const payload = parseTilePayload(typeof req.query.t === 'string' ? req.query.t : undefined);
+  const playbackId = payload.sid ?? createPlaybackId();
+
   // Library-origin fast path: search-time library scan emitted a tile pointing
   // at a pre-extracted file on WebDAV. Skip the whole NZB grab cycle (submit,
   // wait, find video) and dispatch directly via the existing /v proxy/direct/pipe
-  // logic. Tile URL uses libraryVideoPath as the sole query param so it survives
-  // Infuse's iOS handoff (which strips everything after the first '&'). The
-  // /content/ prefix check below is the security boundary; only library tiles
-  // emit this query param so no other source can spoof it.
-  const libraryVideoPathParam = req.query.libraryVideoPath as string | undefined;
+  // logic. New tile URLs carry the path and playback ID in the single `t`
+  // envelope so they survive Infuse's iOS handoff. Keep accepting the legacy
+  // libraryVideoPath query parameter for already-cached stream URLs. The
+  // /content/ prefix check below remains the security boundary.
+  const legacyLibraryVideoPath = req.query.libraryVideoPath as string | undefined;
+  const libraryVideoPathParam = payload.lp ?? legacyLibraryVideoPath;
   if (libraryVideoPathParam) {
-    const decoded = decodeURIComponent(libraryVideoPathParam);
+    const decoded = payload.lp ?? decodeURIComponent(libraryVideoPathParam);
     if (!decoded.startsWith('/content/')) {
       console.warn(`⚠️ Rejected library stream — path not under /content/: ${libraryVideoPathParam}`);
       res.status(400).end();
@@ -564,10 +569,11 @@ export async function handleStream(
       if (config.webdavUser) { directUrl.username = config.webdavUser; directUrl.password = config.webdavPassword || ''; }
       res.redirect(302, directUrl.href);
     } else if (proxyFn && !lobbyFallbackOn) {
-      await proxyFn(req, res, decoded, mode !== 'proxy');
+      await proxyFn(req, res, decoded, mode !== 'proxy', playbackId);
     } else {
       const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
       proxyUrl.searchParams.set('path', decoded);
+      proxyUrl.searchParams.set('_sid', playbackId);
       res.redirect(302, proxyUrl.href);
     }
     return;
@@ -598,7 +604,6 @@ export async function handleStream(
   // `fbg` in URL, or group TTL expired).
   let tPackSearchExitIp: string | undefined;
   const isUfTilePath = req.params.filename === 'ultimate-fallback';
-  const payload = parseTilePayload(typeof req.query.t === 'string' ? req.query.t : undefined);
   fallbackGroupId = payload.fbg;
   tPackSessionKey = payload.sk;
   tPackRc = payload.rc;
@@ -782,11 +787,12 @@ export async function handleStream(
           // cleanup if the client aborts.
           const label = cached.streamingMethod === 'pipe' ? '🔗 Pipe' : '📡 Dual-Stage Proxy';
           if (shouldLogCachedDelivery) console.log(`  ${label} streaming: ${cached.streamData.videoPath}${sizeSuffix}`);
-          await proxyFn(req, res, cached.streamData.videoPath, cached.streamingMethod !== 'proxy');
+          await proxyFn(req, res, cached.streamData.videoPath, cached.streamingMethod !== 'proxy', playbackId);
         } else {
           const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
           proxyUrl.searchParams.set('path', cached.streamData.videoPath);
           proxyUrl.searchParams.set('_fb', req.originalUrl);
+          proxyUrl.searchParams.set('_sid', playbackId);
           if (req.query._norange === '1') proxyUrl.searchParams.set('_norange', '1');
           const label = cached.streamingMethod === 'pipe' ? '🔗 Pipe' : '📡 Dual-Stage Proxy';
           if (shouldLogCachedDelivery) console.log(`  ${label} 302 streaming: ${cached.streamData.videoPath}${sizeSuffix}`);
@@ -878,11 +884,12 @@ export async function handleStream(
             const label = mode === 'pipe' ? '🔗 Pipe' : '📡 Dual-Stage Proxy';
             if (shouldLogLobby) console.log(`  ${label}${inline ? '' : ' 302'} streaming: ${streamData.videoPath}${lobbySizeSuffix}`);
             if (inline) {
-              await proxyFn!(req, res, streamData.videoPath, mode !== 'proxy');
+              await proxyFn!(req, res, streamData.videoPath, mode !== 'proxy', playbackId);
             } else {
               const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
               proxyUrl.searchParams.set('path', streamData.videoPath);
               proxyUrl.searchParams.set('_fb', req.originalUrl);
+              proxyUrl.searchParams.set('_sid', playbackId);
               if (req.query._norange === '1') proxyUrl.searchParams.set('_norange', '1');
               res.redirect(302, proxyUrl.href);
             }
@@ -941,11 +948,12 @@ export async function handleStream(
         if (config.webdavUser) { directUrl.username = config.webdavUser; directUrl.password = config.webdavPassword || ''; }
         res.redirect(302, directUrl.href);
       } else if (proxyFn && !lobbyFallbackOn) {
-        await proxyFn(req, res, usable.videoPath, mode !== 'proxy');
+        await proxyFn(req, res, usable.videoPath, mode !== 'proxy', playbackId);
       } else {
         const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
         proxyUrl.searchParams.set('path', usable.videoPath);
         proxyUrl.searchParams.set('_fb', req.originalUrl);
+        proxyUrl.searchParams.set('_sid', playbackId);
         if (req.query._norange === '1') proxyUrl.searchParams.set('_norange', '1');
         res.redirect(302, proxyUrl.href);
       }
@@ -967,6 +975,7 @@ export async function handleStream(
       const episodeNum = groupForFallthrough.episode ? parseInt(groupForFallthrough.episode, 10) : undefined;
       const includeSeasonPack = nextCandidate.isSeasonPack && seasonNum != null && episodeNum != null && !Number.isNaN(seasonNum) && !Number.isNaN(episodeNum);
       const fallthroughT = encodeTileEnvelope({
+        sid: playbackId,
         url: nextCandidate.nzbUrl,
         title: nextCandidate.title,
         indexer: nextCandidate.indexerName,
@@ -1029,6 +1038,7 @@ export async function handleStream(
               const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
               proxyUrl.searchParams.set('path', hitPath);
               proxyUrl.searchParams.set('_fb', req.originalUrl);
+              proxyUrl.searchParams.set('_sid', playbackId);
               if (req.query._norange === '1') proxyUrl.searchParams.set('_norange', '1');
               res.redirect(302, proxyUrl.href);
               return;
@@ -1219,12 +1229,13 @@ export async function handleStream(
           // Inline proxy — no 302, broadest player compatibility. Subsequent seeks
           // come back to handleStream but hit recentDeliveries (10 min TTL) and
           // skip library check + submission.
-          await proxyFn!(req, res, streamData.videoPath, mode !== 'proxy');
+          await proxyFn!(req, res, streamData.videoPath, mode !== 'proxy', playbackId);
         } else {
           // Redirect to /v endpoint which adds auth + buffering + transparent reconnect
           const proxyUrl = new URL(`${resolveBaseUrl(req)}${req.baseUrl}/v`);
           proxyUrl.searchParams.set('path', streamData.videoPath);
           proxyUrl.searchParams.set('_fb', req.originalUrl);
+          proxyUrl.searchParams.set('_sid', playbackId);
           if (req.query._norange === '1') proxyUrl.searchParams.set('_norange', '1');
           res.redirect(302, proxyUrl.href);
         }
@@ -1292,6 +1303,7 @@ export async function handleStream(
         // Site 4 of 6: build a fresh UF envelope so sk + fbg + rc all survive
         // iOS handoff (single `t` query param, no `&` after the path).
         const lobbyT = encodeTileEnvelope({
+          sid: playbackId,
           sk: sessionKey,
           ...(fallbackGroupId ? { fbg: fallbackGroupId } : {}),
           rc: redirectCount + 1,
@@ -1326,6 +1338,7 @@ export async function handleStream(
   ) {
     // Site 5 of 6: same fresh-envelope pattern as site 4.
     const lobbyT = encodeTileEnvelope({
+      sid: playbackId,
       sk: sessionKey,
       ...(fallbackGroupId ? { fbg: fallbackGroupId } : {}),
       rc: redirectCount + 1,
