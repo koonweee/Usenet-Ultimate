@@ -14,6 +14,7 @@ import { Router } from 'express';
 import http from 'http';
 import https from 'https';
 import { PassThrough } from 'stream';
+import { setTimeout as waitForRetry } from 'node:timers/promises';
 import type { Config } from '../types.js';
 import type { NZBDavConfig } from '../nzbdav/index.js';
 import { encodeWebdavPath, WebDav404Error, buildNzbdavConfig } from '../nzbdav/utils.js';
@@ -641,11 +642,12 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
     url: URL,
     headers: Record<string, string>,
     useHttps: boolean,
+    signal: AbortSignal,
   ): Promise<http.IncomingMessage> {
     const transport = useHttps ? https : http;
     const agent = useHttps ? webdavHttpsAgent : webdavHttpAgent;
     return new Promise((resolve, reject) => {
-      const r = transport.request(url, { method: 'GET', headers, timeout: 30_000, agent }, (upstream) => {
+      const r = transport.request(url, { method: 'GET', headers, timeout: 30_000, agent, signal }, (upstream) => {
         upstream.socket?.setNoDelay(true);
         resolve(upstream);
       });
@@ -674,7 +676,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
   function consumeUpstream(
     upstream: http.IncomingMessage,
     res: http.ServerResponse,
-    req: http.IncomingMessage,
+    signal: AbortSignal,
     onChunk: (byteLength: number) => void,
     skipBytes = 0,
     usePipe = false,
@@ -694,8 +696,10 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         upstream.removeListener('end', onUpstreamEnd);
         upstream.removeListener('error', onUpstreamError);
         buffer.removeAllListeners();
+        buffer.destroy();
         res.removeListener('drain', onResDrain);
-        req.removeListener('close', onClientGone);
+        res.removeListener('close', onClientGone);
+        signal.removeEventListener('abort', onClientGone);
         if (err) reject(err); else resolve();
       };
 
@@ -722,6 +726,8 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
 
       // --- Stage 2: buffer → res (delivery) ---
       const onBufferData = (chunk: Buffer) => {
+        if (settled) return;
+        if (signal.aborted || res.destroyed || res.writableEnded) { onClientGone(); return; }
         // Skip leading bytes on reconnect (overlap from upstream)
         if (skipBytes > 0 && skipped < skipBytes) {
           const remaining = skipBytes - skipped;
@@ -729,8 +735,8 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
           chunk = chunk.subarray(remaining);
           skipped = skipBytes;
         }
-        onChunk(chunk.length);
         res.write(chunk);
+        onChunk(chunk.length);
         // Soft backpressure: pause buffer when res has a large pending backlog
         if (res.writableLength > stageBytes) buffer.pause();
       };
@@ -739,7 +745,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
       const onBufferError = (err: Error) => { upstream.destroy(); finish(err); };
 
       const onClientGone = () => {
-        if (res.writableFinished) return;
+        if (settled || res.writableFinished) return;
         upstream.destroy();
         buffer.destroy();
         const err = new Error('Client disconnected') as NodeJS.ErrnoException;
@@ -765,7 +771,9 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
       buffer.on('end', onBufferEnd);
       buffer.on('error', onBufferError);
       res.on('drain', onResDrain);
-      req.on('close', onClientGone);
+      res.once('close', onClientGone);
+      signal.addEventListener('abort', onClientGone, { once: true });
+      if (signal.aborted || res.destroyed) onClientGone();
     });
   }
 
@@ -809,10 +817,25 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
     // Track this request and get an abort handle
     let currentUpstream: http.IncomingMessage | undefined;
     let aborted = false;
-    const reqId = trackRequest(safePath, rangeStart, isFullRequest, usePipe, (reason) => {
-      endReason = reason;
+    const cancellation = new AbortController();
+    const cancel = (reason: StreamEndReason) => {
+      if (aborted) return;
       aborted = true;
+      endReason = reason;
+      cancellation.abort();
       currentUpstream?.destroy();
+    };
+    // IncomingMessage.close means the GET was read, not that its response is gone.
+    // Observe the response before awaiting headers so pending connects also cancel.
+    const clientGone = () => req.aborted || res.destroyed;
+    const onClientGone = () => {
+      if (!res.writableFinished) cancel('client_disconnect');
+    };
+    res.once('close', onClientGone);
+    req.once('aborted', onClientGone);
+    if (clientGone()) onClientGone();
+    const reqId = trackRequest(safePath, rangeStart, isFullRequest, usePipe, (reason) => {
+      cancel(reason);
       if (!res.writableFinished) res.destroy();
     });
 
@@ -824,7 +847,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         const headers = { ...baseHeaders };
         if (req.headers.range) headers['Range'] = req.headers.range as string;
         try {
-          upstream = await fetchUpstream(targetUrl, headers, useHttps);
+          upstream = await fetchUpstream(targetUrl, headers, useHttps, cancellation.signal);
           currentUpstream = upstream;
           break;
         } catch (err: any) {
@@ -836,7 +859,7 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
             return;
           }
           console.warn(`\u26A0\uFE0F WebDAV proxy retry ${attempt}/${MAX_PROXY_RETRIES}: ${err.message}`);
-          await new Promise(r => setTimeout(r, 100));
+          await waitForRetry(100, undefined, { signal: cancellation.signal });
         }
       }
       if (!upstream || aborted) { upstream?.destroy(); return; }
@@ -853,10 +876,11 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         }
         if (req.headers.range) redirectHeaders['Range'] = req.headers.range as string;
         try {
-          upstream = await fetchUpstream(redirectTarget, redirectHeaders, redirectTarget.protocol === 'https:');
+          upstream = await fetchUpstream(redirectTarget, redirectHeaders, redirectTarget.protocol === 'https:', cancellation.signal);
           currentUpstream = upstream;
           if (aborted) { upstream.destroy(); return; }
         } catch (err: any) {
+          if (aborted) return;
           endReason = 'upstream_connect_error';
           console.error(`\u274C WebDAV proxy redirect failed: ${err.message}`);
           if (!res.headersSent) res.status(502).send('WebDAV proxy error');
@@ -888,16 +912,17 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         for (let attempt = 1; attempt <= MAX_PROXY_RETRIES; attempt++) {
           if (aborted) return;
           try {
-            retryUpstream = await fetchUpstream(targetUrl, baseHeaders, useHttps);
+            retryUpstream = await fetchUpstream(targetUrl, baseHeaders, useHttps, cancellation.signal);
             currentUpstream = retryUpstream;
             break;
           } catch {
+            if (aborted) return;
             if (attempt >= MAX_PROXY_RETRIES) {
               endReason = 'upstream_connect_error';
               if (!res.headersSent) res.status(502).send('WebDAV proxy error');
               return;
             }
-            await new Promise(r => setTimeout(r, 100));
+            await waitForRetry(100, undefined, { signal: cancellation.signal });
           }
         }
         if (!retryUpstream || aborted) { retryUpstream?.destroy(); return; }
@@ -957,13 +982,13 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
 
       // Initial consume attempt
       try {
-        await consumeUpstream(upstream, res, req, (n) => { bytesSent += n; telemetry.addBytes(n); }, 0, usePipe);
+        await consumeUpstream(upstream, res, cancellation.signal, (n) => { bytesSent += n; telemetry.addBytes(n); }, 0, usePipe);
         endReason = expectedBytes != null && bytesSent < expectedBytes ? 'upstream_truncated' : 'complete';
         if (!res.writableFinished) res.end();
         return;
       } catch {
-        if (!aborted && (req.destroyed || res.destroyed)) endReason = 'client_disconnect';
-        if (aborted || req.destroyed || res.writableFinished || res.destroyed) return;
+        if (!aborted && clientGone()) endReason = 'client_disconnect';
+        if (aborted || clientGone() || res.writableFinished) return;
         endReason = 'upstream_interrupted';
       }
 
@@ -973,17 +998,18 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         const resumeByte = streamRangeStart + bytesSent;
         const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** Math.min(rc - 1, 3), RECONNECT_MAX_DELAY_MS);
 
-        await new Promise(r => setTimeout(r, delay));
-        if (aborted || req.destroyed || res.writableFinished || res.destroyed) return;
+        await waitForRetry(delay, undefined, { signal: cancellation.signal });
+        if (aborted || clientGone() || res.writableFinished) return;
 
         // Reconnect with updated Range
         const rangeStr = rangeEnd != null ? `bytes=${resumeByte}-${rangeEnd}` : `bytes=${resumeByte}-`;
         let newUpstream: http.IncomingMessage;
         try {
-          newUpstream = await fetchUpstream(targetUrl, { ...baseHeaders, Range: rangeStr }, useHttps);
+          newUpstream = await fetchUpstream(targetUrl, { ...baseHeaders, Range: rangeStr }, useHttps, cancellation.signal);
           currentUpstream = newUpstream;
           if (aborted) { newUpstream.destroy(); return; }
         } catch {
+          if (aborted) return;
           continue;
         }
 
@@ -1033,13 +1059,13 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
         }
 
         try {
-          await consumeUpstream(newUpstream, res, req, (n) => { bytesSent += n; telemetry.addBytes(n); }, skipBytes, usePipe);
+          await consumeUpstream(newUpstream, res, cancellation.signal, (n) => { bytesSent += n; telemetry.addBytes(n); }, skipBytes, usePipe);
           endReason = expectedBytes != null && bytesSent < expectedBytes ? 'upstream_truncated' : 'complete';
           if (!res.writableFinished) res.end();
           return;
         } catch {
-          if (!aborted && (req.destroyed || res.destroyed)) endReason = 'client_disconnect';
-          if (aborted || req.destroyed || res.writableFinished || res.destroyed) return;
+          if (!aborted && clientGone()) endReason = 'client_disconnect';
+          if (aborted || clientGone() || res.writableFinished) return;
           endReason = 'upstream_interrupted';
         }
       }
@@ -1050,11 +1076,15 @@ export function createNzbdavStreamRoutes(deps: NzbdavDeps): Router {
     } catch (err: any) {
       if (err instanceof WebDav404Error) throw err;
       if (aborted) return;
-      if (req.destroyed || res.destroyed) endReason = 'client_disconnect';
+      if (clientGone()) endReason = 'client_disconnect';
       if (!res.headersSent) throw err;
       console.error(`\u274C WebDAV proxy error: ${(err as Error).message}`);
     } finally {
       if (progressTimer) clearInterval(progressTimer);
+      res.removeListener('close', onClientGone);
+      req.removeListener('aborted', onClientGone);
+      cancellation.abort();
+      currentUpstream?.destroy();
       telemetry.end(endReason);
       untrackRequest(safePath, reqId);
     }
